@@ -1,0 +1,141 @@
+# Dev Factory agent run — dispatched by the Artisana AI control plane on the DEFAULT branch only.
+#
+# Two jobs, two machines:
+#   agent    Trusted steps run as the runner user. UNTRUSTED code (the agent CLI, and the tests it wrote) runs only
+#            as the unprivileged Unix user `devfactory-agent`: no sudo, no GitHub token, no OIDC request token, no .git,
+#            and its network limited by iptables (owner match) to the published Anthropic API ranges, DNS blocked.
+#            The runner's own connection to GitHub is untouched. dry_run=true replaces the agent by a deterministic
+#            script (validation P2, no AI call).
+#   publish  Deterministic, default-branch tooling only, alone with the App key: checks the patch (data, never run),
+#            pushes ONLY agent/<TASK>, opens or updates ONE draft pull request. Never merges, approves or tags.
+#
+# Pinned on 30/10/2026 (release >= 2 weeks old, owner `actions`, not archived):
+#   actions/checkout v7.0.1 3d3c42e5…, actions/upload-artifact v7.0.2 cf430e03…, actions/download-artifact v8.0.2 9000827c…,
+#   actions/create-github-app-token v3.3.0 64ab729a…; Claude Code CLI 2.1.301 (15/10/2026), native linux-x64 tarball,
+#   sha512 verified by install_claude.py, no install script.
+name: devfactory-agent
+run-name: devfactory ${{ inputs.key }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      key: { description: "devfactory:<task id>:<run>", required: true }
+      role: { description: "developer | reviewer", required: true }
+      agent: { description: "dev agent id", required: true }
+      base: { description: "commit to start from", required: true }
+      branch: { description: "agent/<TASK>", required: true }
+      brief: { description: "ticket (JSON): title, acceptance criteria", required: true }
+      max_turns: { description: "agent turns", required: true }
+      dry_run: { description: "true = deterministic script, no AI (validation P2)", required: false, default: "false" }
+
+permissions: {}
+
+concurrency:
+  group: devfactory-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      KEY: ${{ inputs.key }}
+      ROLE: ${{ inputs.role }}
+      BASE: ${{ inputs.base }}
+      AGENT: ${{ inputs.agent }}
+      BRANCH: ${{ inputs.branch }}
+      MAX_TURNS: ${{ inputs.max_turns }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      BRIEF: ${{ inputs.brief }}
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_OIDC_AUDIENCE: ${{ vars.ANTHROPIC_OIDC_AUDIENCE }}
+    steps:
+      - name: Inputs (format checked again; passed through env, never interpolated in a shell)
+        run: >-
+          python3 -c "import os,re,sys; e=os.environ; sys.exit(not (
+          re.fullmatch(r'devfactory:[0-9]{1,9}:[0-9]{1,4}', e['KEY']) and e['ROLE'] in ('developer', 'reviewer')
+          and re.fullmatch(r'[0-9a-f]{40}', e['BASE']) and re.fullmatch(r'[a-z_]{3,40}', e['AGENT'])
+          and re.fullmatch(r'agent/[A-Z][A-Z0-9-]{0,15}', e['BRANCH']) and re.fullmatch(r'[1-9][0-9]?', e['MAX_TURNS'])
+          and e['DRY_RUN'] in ('true', 'false') and len(e['BRIEF']) <= 20000))"
+      - name: Trusted tooling (default branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          path: trusted
+          persist-credentials: false
+      - name: Work tree at the base commit (kept pristine; the agent gets a copy without .git)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          ref: ${{ inputs.base }}
+          path: work
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Claude Code CLI (pinned version, sha512 verified, no install script)
+        if: env.DRY_RUN == 'false'
+        run: sudo -E python3 trusted/.devfactory/install_claude.py
+      - name: Isolated agent user and its copy of the work tree
+        run: sudo -E bash trusted/.devfactory/agent_user.sh
+      - name: Anthropic identity token (GitHub OIDC), handed to the agent user as a file
+        if: env.DRY_RUN == 'false'
+        run: python3 trusted/.devfactory/oidc_token.py
+      - name: Network lock for the agent user (Anthropic API only, DNS blocked), then canaries
+        run: sudo -E bash trusted/.devfactory/netlock.sh apply && sudo -E bash trusted/.devfactory/netlock.sh canary
+      - name: Agent (or deterministic dry run), as the agent user, bounded turns and time
+        timeout-minutes: 15
+        run: sudo -E bash trusted/.devfactory/run_agent.sh
+      - name: Tests of the result, as the agent user, under the same lock
+        timeout-minutes: 4
+        run: sudo -E bash trusted/.devfactory/run_tests.sh
+      - name: Stop every agent process, then freeze the patch in the pristine work tree
+        if: always()
+        run: sudo -E bash trusted/.devfactory/collect.sh
+      - name: Report (trusted; the agent's files are data)
+        run: python3 trusted/.devfactory/report.py --patch "$RUNNER_TEMP/patch.diff" --out "$RUNNER_TEMP/report.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: devfactory-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/patch.diff
+            ${{ runner.temp }}/report.json
+          retention-days: 3
+
+  publish:
+    needs: agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: devfactory-publish        # the only job that can read the App key (environment secret, main only)
+    permissions:
+      contents: read
+    env:
+      KEY: ${{ inputs.key }}
+      ROLE: ${{ inputs.role }}
+      BASE: ${{ inputs.base }}
+      BRANCH: ${{ inputs.branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          path: trusted
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: devfactory-${{ github.run_id }}
+          path: artifact
+      - name: Check the patch (data only; nothing from it is executed)
+        run: python3 trusted/.devfactory/publish.py --check-only --patch artifact/patch.diff --report artifact/report.json
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510   # v3.3.0
+        with:
+          app-id: ${{ vars.DEVFACTORY_APP_ID }}
+          private-key: ${{ secrets.DEVFACTORY_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Push agent branch and draft pull request
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 trusted/.devfactory/publish.py --patch artifact/patch.diff --report artifact/report.json
