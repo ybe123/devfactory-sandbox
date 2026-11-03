@@ -1,10 +1,11 @@
-"""Fictitious sandbox module (Dev Factory lot 2): availability of the units of a demo guest house.
-
-Data and rules are invented for the validation of the Dev Factory; they describe no real establishment.
-"""
+"""Fictitious sandbox module (Dev Factory P2 dry run)."""
 from datetime import date
 
 
 def available(unit: str, start: date, end: date, bookings: dict[str, list[tuple[date, date]]]) -> str:
-    """'available', 'unavailable' or 'not_configured' for the nights [start, end) of `unit`."""
-    raise NotImplementedError("to be written by the developer agent (ticket T1)")
+    if unit not in bookings:
+        return "not_configured"
+    if start >= end:
+        raise ValueError("empty stay")
+    overlaps = any(b_start < end and start < b_end for b_start, b_end in bookings[unit])
+    return "unavailable" if overlaps else "available"
